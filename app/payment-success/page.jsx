@@ -21,7 +21,7 @@ export default function PaymentSuccess() {
         </p>
 
         <Link
-          href="/"
+          href="https://evermorenetwork.com"
           className="
           mt-8
           inline-flex

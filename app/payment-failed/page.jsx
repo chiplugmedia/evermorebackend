@@ -17,7 +17,7 @@ export default function PaymentFailed() {
         </p>
 
         <Link
-          href="/register"
+          href="https://evermorenetwork.com/register"
           className="
           mt-8
           inline-flex
