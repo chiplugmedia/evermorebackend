@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import pool from "../../../lib/db";
-import { sendRegistrationEmail } from "../../../lib/email";
+import pool from "@/lib/db";
+import { sendRegistrationEmail } from "@/lib/email";
 
 export async function GET(req) {
   const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000";
@@ -8,10 +8,15 @@ export async function GET(req) {
   try {
     const { searchParams } = new URL(req.url);
     const transaction_id = searchParams.get("transaction_id");
+    const status = searchParams.get("status");
+    const tx_ref = searchParams.get("tx_ref");
 
-    // No transaction ID provided by payment gateway
-    if (!transaction_id) {
-      return NextResponse.redirect(new URL("/payment-failed", baseUrl));
+    // Handle immediate cancellation or missing transaction ID
+    if (status === "cancelled" || !transaction_id) {
+      const failedUrl = transaction_id
+        ? `/payment-failed?transaction_id=${transaction_id}`
+        : "/payment-failed";
+      return NextResponse.redirect(new URL(failedUrl, baseUrl));
     }
 
     // Verify payment with Flutterwave
@@ -35,17 +40,17 @@ export async function GET(req) {
       );
     }
 
-    const tx_ref = result.data.tx_ref;
+    const gatewayTxRef = result.data.tx_ref || tx_ref;
 
-    // Find registration
+    // Find registration record
     const [rows] = await pool.query(
       `
       SELECT *
       FROM registrations
-      WHERE tx_ref = ?
+      WHERE tx_ref = ? OR transaction_id = ?
       LIMIT 1
       `,
-      [tx_ref],
+      [gatewayTxRef, transaction_id],
     );
 
     if (!rows.length) {
@@ -56,10 +61,11 @@ export async function GET(req) {
 
     const registration = rows[0];
 
-    // Verify amount and payment status
+    // Validate amount, currency, and status
     const paymentValid =
       result.data.status === "successful" &&
-      Number(result.data.amount) >= Number(registration.amount);
+      Number(result.data.amount) >= Number(registration.amount) &&
+      result.data.currency === "NGN";
 
     if (paymentValid) {
       await pool.query(
@@ -71,14 +77,14 @@ export async function GET(req) {
           flutterwave_status = ?,
           flutterwave_message = ?,
           message = ?
-        WHERE tx_ref = ?
+        WHERE id = ?
         `,
         [
           transaction_id,
           result.data.status,
-          result.message || "Payment verified",
+          result.message || "Payment verified successfully",
           "Payment verified successfully",
-          tx_ref,
+          registration.id,
         ],
       );
 
@@ -107,14 +113,14 @@ export async function GET(req) {
         flutterwave_status = ?,
         flutterwave_message = ?,
         message = ?
-      WHERE tx_ref = ?
+      WHERE id = ?
       `,
       [
         transaction_id,
         result.data.status || "failed",
         result.message || "Verification failed",
         "Payment verification failed",
-        tx_ref,
+        registration.id,
       ],
     );
 
