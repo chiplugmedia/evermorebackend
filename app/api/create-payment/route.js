@@ -1,15 +1,16 @@
 import { NextResponse } from "next/server";
 import pool from "../../../lib/db";
 import bcrypt from "bcryptjs";
+import { createSessionToken, getSetCookieHeader } from "../../../lib/auth";
 
 export async function POST(req) {
   try {
     const body = await req.json();
 
-    const { fullname, phone, email, plan, password } = body;
+    const { fullname, phone, email, plan = "Free", password } = body;
 
     // Validation
-    if (!fullname || !phone || !email || !password || !plan) {
+    if (!fullname || !phone || !email || !password) {
       return NextResponse.json(
         {
           success: false,
@@ -29,62 +30,109 @@ export async function POST(req) {
       );
     }
 
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanUsername = cleanEmail.split("@")[0].replace(/[^a-z0-9_]/g, "");
+
     // Check existing email
-    // const [existing] = await pool.query(
-    //   `
-    //   SELECT id
-    //   FROM registrations
-    //   WHERE email=?
-    //   LIMIT 1
-    //   `,
-    //   [email],
-    // );
+    const [existing] = await pool.query(
+      `SELECT id FROM registrations WHERE LOWER(email)=? LIMIT 1`,
+      [cleanEmail],
+    );
 
-    // if (existing.length > 0) {
-    //   return NextResponse.json(
-    //     {
-    //       success: false,
-    //       message: "Email already registered",
-    //     },
-    //     { status: 400 },
-    //   );
-    // }
+    if (existing.length > 0) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Email already registered. Please log in.",
+        },
+        { status: 400 },
+      );
+    }
 
-    // Plan Amount
-    const amount = plan === "Premium" ? 14000 : 7000;
-
-    const tx_ref = `EVER-${Date.now()}-${Math.floor(Math.random() * 999999)}`;
-
+    const isFree = !plan || plan === "Free";
+    const amount = isFree ? 0 : plan === "Premium" ? 14000 : 7000;
+    const tx_ref = `${isFree ? "FREE" : "EVER"}-${Date.now()}-${Math.floor(Math.random() * 999999)}`;
     const hashedPassword = await bcrypt.hash(password, 10);
+    const initialStatus = isFree ? "FREE" : "PENDING";
+    const initialMsg = isFree ? "Free Contributor Account" : "Waiting for payment";
 
-    // Save Registration First
-    await pool.query(
+    // Save Registration
+    const [insertResult] = await pool.query(
       `
       INSERT INTO registrations
       (
         fullname,
+        username,
         phone,
         email,
+        role,
         plan,
         password,
         amount,
         tx_ref,
         payment_status,
-        message
+        status,
+        message,
+        created_at
       )
       VALUES
       (
-        ?, ?, ?, ?, ?, ?, ?,
-        'PENDING',
-        'Waiting for payment'
+        ?, ?, ?, ?, 'user', ?, ?, ?, ?,
+        ?,
+        'active',
+        ?,
+        NOW()
       )
       `,
-      [fullname, phone, email, plan, hashedPassword, amount, tx_ref],
+      [
+        fullname.trim(),
+        cleanUsername,
+        phone.trim(),
+        cleanEmail,
+        isFree ? "Free" : plan,
+        hashedPassword,
+        amount,
+        tx_ref,
+        initialStatus,
+        initialMsg,
+      ],
     );
 
+    const newUserId = insertResult.insertId;
+
+    // If Free registration, auto-login immediately without Flutterwave
+    if (isFree) {
+      const token = createSessionToken({
+        userId: newUserId,
+        email: cleanEmail,
+        username: cleanUsername,
+        role: "user",
+      });
+
+      const response = NextResponse.json({
+        success: true,
+        message: "Free registration complete! Welcome to QuickMuse.",
+        user: {
+          id: newUserId,
+          fullname,
+          username: cleanUsername,
+          email: cleanEmail,
+          phone,
+          role: "user",
+          plan: "Free",
+          status: "active",
+        },
+        token,
+        redirect: "/dashboard",
+      });
+
+      response.headers.set("Set-Cookie", getSetCookieHeader(token));
+      return response;
+    }
+
+    // Otherwise, generate Flutterwave payment link for paid plan upgrade
     const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000";
 
-    // Flutterwave Request
     const flutterwaveRes = await fetch(
       "https://api.flutterwave.com/v3/payments",
       {
@@ -97,18 +145,15 @@ export async function POST(req) {
           tx_ref,
           amount,
           currency: "NGN",
-
           redirect_url: `${baseUrl}/api/verify-payment`,
-
           customer: {
-            email,
+            email: cleanEmail,
             phonenumber: phone,
             name: fullname,
           },
-
           customizations: {
-            title: "Evermore Subscription",
-            description: `${plan} Plan Subscription`,
+            title: "QuickMuse Subscription",
+            description: `${plan} Plan Upgrade`,
             logo: `${baseUrl}/logo.png`,
           },
         }),
@@ -117,7 +162,6 @@ export async function POST(req) {
 
     const data = await flutterwaveRes.json();
 
-    // Flutterwave Error
     if (data.status !== "success" || !data.data?.link) {
       await pool.query(
         `
@@ -144,7 +188,6 @@ export async function POST(req) {
       );
     }
 
-    // Save Flutterwave Message
     await pool.query(
       `
       UPDATE registrations
